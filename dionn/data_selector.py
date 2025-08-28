@@ -5,6 +5,8 @@ from sklearn.decomposition import PCA
 import tensorflow as tf
 from scipy import linalg, special
 import warnings
+from scipy.optimize import linear_sum_assignment
+import torch
 
 class StudentMixture:
     """Modelo de mezcla de distribuciones t de Student."""
@@ -103,19 +105,8 @@ class StudentMixture:
         return np.exp(log_resp)
 
 class DataSelector:
-    def __init__(self, X_tr, y_tr, epochs_to_start_filter, update_period_in_epochs, filter_percentile=0.3, 
+    def __init__(self, X_tr, y_tr, epochs_to_start_filter, update_period_in_epochs, filter_percentile=0.3,
                  random_state=None, train_with_outliers=False, filter_model="gmm"):
-        """
-        Parámetros:
-          - X_tr: datos de entrenamiento.
-          - y_tr: etiquetas de entrenamiento (acepta tf.Tensor o numpy.array).
-          - epochs_to_start_filter: epoch a partir del cual empezar el filtrado.
-          - update_period_in_epochs: frecuencia (en epochs) de actualización del filtrado.
-          - filter_percentile: percentil para definir el umbral de filtrado.
-          - random_state: semilla para reproducibilidad.
-          - train_with_outliers: flag para incluir outliers durante el entrenamiento.
-          - filter_model: método de clustering a utilizar ('gmm' o 'smm'). Por defecto es 'gmm'.
-        """
         self.X_tr = X_tr
         self.y_tr = y_tr.numpy() if isinstance(y_tr, tf.Tensor) else y_tr
         self.out_clases_number = self.y_tr.shape[1]
@@ -134,12 +125,10 @@ class DataSelector:
         self.filter_model = filter_model.lower()  # 'gmm' o 'smm'
 
     def check_filter_update_criteria(self, epoch):
-        """Determina si se debe actualizar el filtrado en este epoch."""
-        return (epoch >= self.epochs_to_start_filter and 
+        return (epoch >= self.epochs_to_start_filter and
                 (epoch - self.epochs_to_start_filter) % self.update_period_in_epochs == 0)
 
     def apply_pca(self, inspector_layer_out, explained_variance=None, n_components=None):
-        """Aplica PCA para reducir la dimensionalidad de la salida del inspector."""
         if explained_variance is not None:
             pca = PCA(n_components=explained_variance)
         elif n_components is not None:
@@ -159,14 +148,28 @@ class DataSelector:
         return transformed_out, n_components
 
     def get_train_data(self, epoch, model, outs_posibilities, explained_variance=None, n_components=None):
-        """
-        Realiza el filtrado de datos usando el método de clustering seleccionado (GMM o SMM)
-        y devuelve los datos filtrados junto con información adicional.
-        """
         if self.check_filter_update_criteria(epoch):
-            # Obtener la salida del "inspector" y reducir la dimensionalidad
-            inspector_layer_out = model.inspector_out(self.X_tr).numpy()
+            def batched_inspector_out(model, X, batch_size=256):
+                outs = []
+                n = len(X)
+                for i in range(0, n, batch_size):
+                    batch = X[i:i+batch_size]
+                    # Convierte a tensor torch en el device correcto (por si X es numpy/tf)
+                    if isinstance(batch, tf.Tensor):
+                        batch = batch.numpy()
+                    batch = torch.tensor(batch, dtype=torch.float32, device=next(model.parameters()).device)
+                    with torch.no_grad():
+                        out = model.inspector_out(batch)
+                        if isinstance(out, torch.Tensor):
+                            outs.append(out.cpu().numpy())
+                        else:
+                            outs.append(np.array(out))
+                    del batch, out  # Limpieza proactiva
+                return np.concatenate(outs, axis=0)
+            inspector_layer_out = batched_inspector_out(model, self.X_tr, batch_size=256)
             inspector_layer_out, n_components = self.apply_pca(inspector_layer_out, explained_variance, n_components)
+
+            original_classes = list(outs_posibilities)
 
             # Selección del método de clustering
             if self.filter_model == "gmm":
@@ -190,54 +193,81 @@ class DataSelector:
             else:
                 raise ValueError("Método de filtrado inválido. Usa 'gmm' o 'smm'.")
 
-            # Mapeo de clusters a clases reales
-            class_cluster_to_real = {}
-            percentage_of_pertenence = {}
-            original_classes = list(outs_posibilities)
-            for class_it in original_classes:
-                mask = self.y_tr.argmax(axis=1) == class_it
-                cluster_counts = Counter(clusterized_outs[mask])
-                for cluster, current_count in cluster_counts.most_common():
-                    current_percentage = current_count / mask.sum()
-                    if cluster in class_cluster_to_real:
-                        prev_class = class_cluster_to_real[cluster]
-                        if current_percentage > percentage_of_pertenence[prev_class]:
-                            # Actualiza el mapeo
-                            class_cluster_to_real[cluster] = class_it
-                            percentage_of_pertenence[class_it] = current_percentage
-                            
-                    else:
-                        class_cluster_to_real[cluster] = class_it
-                        percentage_of_pertenence[class_it] = current_percentage
-                    break
+            # --- ASIGNACIÓN ÓPTIMA CLASE-CLUSTER (Hungarian) ---
+            num_classes = len(original_classes)
+            num_clusters = clusterized_outs_proba.shape[1]
+
+            count_matrix = np.zeros((num_classes, num_clusters), dtype=int)
+            clases_true = self.y_tr.argmax(axis=1)
+            for i in range(len(clases_true)):
+                count_matrix[clases_true[i], clusterized_outs[i]] += 1
+
+            row_ind, col_ind = linear_sum_assignment(-count_matrix)
+            class_cluster_to_real = {col: original_classes[row] for row, col in zip(row_ind, col_ind)}
+
+            print("Asignación clase-cluster:")
+            print(class_cluster_to_real)
+
+            # Reordena las probabilidades según asignación óptima
+            clases_true = self.y_tr.argmax(axis=1)
+            probs = []
+            for i in range(len(clases_true)):
+                clase_real = clases_true[i]
+                cluster_asociado = [c for c, clase in class_cluster_to_real.items() if clase == clase_real]
+                if len(cluster_asociado) == 0:
+                    probs.append(0.0)
+                else:
+                    probs.append(clusterized_outs_proba[i, cluster_asociado[0]])
+            prob_correct_class_cluster = np.array(probs)
 
             size_set_train = self.X_tr.shape[0]
             print(f"Tamaño del set de entrenamiento: {size_set_train}")
 
-            if set(class_cluster_to_real.values()) != set(original_classes):
-                print("Warning: existen clases sin un cluster asociado")
-                print("Warning: no se realizó el filtrado")
-                return self.previous_X_tr, self.previous_y_tr, self.original_indices, self.all_removed_indices, self.inspector_layer_out
-
-            print("Cada clase tiene un único cluster asociado.")
-            sorted_keys = [k for k, v in sorted(class_cluster_to_real.items(), key=lambda item: item[1])]
-            clusterized_outs_proba = clusterized_outs_proba[:, sorted_keys]
-            prob_correct_class_cluster = clusterized_outs_proba[np.arange(len(clusterized_outs_proba)), self.y_tr.argmax(axis=1)]
-
-            # Filtrado por clases según umbral
+            # === AQUÍ VA LA LÓGICA LIMPIA DEL UMBRAL ===
             filtered_indices_per_class = []
+            min_pureza = 0.6    # No filtrar si el cluster de la clase es poco puro
+            min_keep = 0.5      # Siempre dejar al menos 50% de datos de la clase
             for class_it in original_classes:
-                class_mask = self.y_tr.argmax(axis=1) == class_it
+                # ¿Cuál es el cluster asociado a esta clase?
+                cluster_asociado = [c for c, clase in class_cluster_to_real.items() if clase == class_it]
+                if not cluster_asociado:
+                    print(f"[WARNING] Clase {class_it} no tiene cluster asignado. No se filtra nada.")
+                    continue
+                cluster_idx = cluster_asociado[0]
+                # Pureza del cluster para esta clase
+                in_cluster = (clusterized_outs == cluster_idx)
+                if in_cluster.sum() == 0:
+                    print(f"[WARNING] Cluster {cluster_idx} está vacío. No se filtra nada para la clase {class_it}.")
+                    continue
+                clases_in_cluster = clases_true[in_cluster]
+                pureza = (clases_in_cluster == class_it).sum() / in_cluster.sum()
+                print(f"Pureza del cluster {cluster_idx} para la clase {class_it}: {pureza:.2f}")
+                class_mask = (clases_true == class_it)
                 class_probs = np.round(prob_correct_class_cluster[class_mask], 2)
-                threshold = np.percentile(class_probs, self.filter_percentile * 100)
-                if self.train_with_outliers:
-                    threshold = round(threshold, 2)
+                n_total = len(class_probs)
+                if n_total == 0:
+                    print(f"[WARNING] Clase {class_it} vacía tras clusterización.")
+                    continue
+                # Si la pureza del cluster es baja, no filtres
+                if pureza < min_pureza:
+                    print(f"[PROTEGIDO] Clase {class_it} NO filtrada (pureza < {min_pureza})")
+                    indices_keep = np.where(class_mask)[0]
                 else:
-                    threshold = round(min(threshold, 1 / self.out_clases_number), 2)
-                print(f'Número de probabilidades por debajo del umbral {threshold} para la clase {class_it}: ',
-                      len(class_probs[class_probs < threshold]))
-                indices_above_threshold = np.where(class_mask)[0][class_probs >= threshold]
-                filtered_indices_per_class.append(indices_above_threshold)
+                    threshold = np.percentile(class_probs, self.filter_percentile * 100)
+                    threshold = round(threshold, 2)
+                    indices_above_threshold = np.where(class_mask)[0][class_probs >= threshold]
+                    # Protección mínima: no filtres más del X% de la clase
+                    if len(indices_above_threshold) < int(min_keep * n_total):
+                        print(f"[PROTEGIDO] No se filtra más del {min_keep*100:.0f}% de la clase {class_it}.")
+                        num_keep = int(min_keep * n_total)
+                        sorted_indices = np.argsort(-class_probs)   # mayor prob a menor
+                        indices_keep = np.where(class_mask)[0][sorted_indices[:num_keep]]
+                    else:
+                        indices_keep = indices_above_threshold
+                    print(f'Filtrando {n_total - len(indices_keep)} de {n_total} elementos en clase {class_it}')
+                filtered_indices_per_class.append(indices_keep)
+
+            # ===========================================
 
             self.filtered_index = np.concatenate(filtered_indices_per_class)
             original_indices = np.arange(self.X_tr.shape[0], dtype=int)
@@ -260,7 +290,6 @@ class DataSelector:
             print(f"Tamaño de datos removidos: {size_set_train - size_set_post}")
 
             if self.train_with_outliers:
-                # Manejo de outliers: se mezclan datos removidos con puntos aleatorios
                 removed_data = tf.gather(self.X_tr, np.array(removed_data_indices, dtype=int))
                 removed_labels = tf.gather(self.y_tr, np.array(removed_data_indices, dtype=int))
                 removed_indices = tf.gather(self.original_indices, np.array(removed_data_indices, dtype=int))
@@ -280,7 +309,6 @@ class DataSelector:
                 filtered_original_indices = np.concatenate((removed_indices, random_original_indices), axis=0)
                 print(f"Entrenamiento con outliers: se agregaron {num_removed} puntos removidos y {num_removed} puntos aleatorios.")
 
-            # Actualización de variables para el siguiente epoch
             self.X_tr = filtered_X_tr
             self.y_tr = filtered_y_tr
             self.original_indices = filtered_original_indices
@@ -290,8 +318,7 @@ class DataSelector:
 
         return self.return_filtered_data()
 
-    def return_filtered_data(self):
-        """Devuelve los datos filtrados y la información asociada."""
-        return self.X_tr, self.y_tr, self.original_indices, self.all_removed_indices, self.inspector_layer_out
 
+    def return_filtered_data(self):
+        return self.X_tr, self.y_tr, self.original_indices, self.all_removed_indices, self.inspector_layer_out
 
