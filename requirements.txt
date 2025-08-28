@@ -12,3 +12,4 @@ opt-einsum>=2.3.2
 plotly
 ml-dtypes==0.3.1
 seaborn
+scipy==1.14.1
