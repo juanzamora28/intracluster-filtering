@@ -6,6 +6,7 @@ from scipy import linalg, special
 from scipy.stats import chi2, f as f_dist
 import torch
 import warnings
+import math
 
 # =========================
 # Util: clip [0,1] con warning
@@ -145,7 +146,7 @@ def _maybe_to_numpy(x):
 
 
 # =========================
-# DataSelector (GMM/SMM) + score compuesto y filtrado SOFT + reduccion (PCA)
+# DataSelector (GMM/SMM) + score compuesto + MAHA estricto + PCA
 # =========================
 class DataSelector:
     def __init__(self,
@@ -170,21 +171,19 @@ class DataSelector:
         self.epochs_to_start_filter = int(epochs_to_start_filter)
         self.update_period_in_epochs = int(update_period_in_epochs)
 
-        # ---- parametros del usuario con clip + warning ----
+        # ---- parametros usuario (con clip) ----
         self.filter_percentile = _clip01_with_warning("filter_percentile", filter_percentile)
         self.random_state = random_state
         self.train_with_outliers = bool(train_with_outliers)
         self.filter_model = str(filter_model).lower()
-
         self.gating_score_abs = _clip01_with_warning("gating_score_abs", gating_score_abs, allow_none=True)
         self.drop_below_score = _clip01_with_warning("drop_below_score", drop_below_score, allow_none=True)
-
         self.tau = float(tau)
         self.batch_size_forward = int(batch_size_forward)
         self.gmm_covariance_type = gmm_covariance_type
         self.gmm_reg_covar = gmm_reg_covar
 
-        # pesos compuestos (normalizamos para que sumen 1)
+        # pesos compuestos normalizados
         w1 = _clip01_with_warning("weight_score", weight_score)
         w2 = _clip01_with_warning("weight_maha", weight_maha)
         s = w1 + w2
@@ -206,20 +205,29 @@ class DataSelector:
 
         # ---- mapas de scores ----
         self.removal_scores = {}        # {orig_idx: S_compuesto_al_remover}
-        self.last_scores_map = {}       # {orig_idx: S_compuesto_ultimo_epoch}  ← S_i
+        self.last_scores_map = {}       # {orig_idx: S_compuesto_ultimo_epoch}
         self.last_consistency_map = {}  # {orig_idx: s_i}
         self.last_maha_tail_map = {}    # {orig_idx: s_i^M}
 
-        # buffers del último clustering (para SMM: elegir nu_c por componente dominante)
+        # ---- mapas MAHA para inspección ----
+        self.last_maha_d2_map   = {}    # {orig_idx: d^2}
+        self.last_maha_thr_map  = {}    # {orig_idx: d^2_thr}
+        self.last_maha_excess_map = {}  # {orig_idx: d^2 - d^2_thr}
+
+        # buffers clustering
         self._last_R = None
         self._last_mix_model = None
+
+        # ---- constantes internas MAHA (no se exponen) ----
+        self._MAHA_ALPHA = 0.01                 # umbral teórico por clase: 1 - alpha
+        self._MAHA_TOP_FRAC_EXCEEDERS = 0.8    # elimina el 5% ENTRE LOS QUE EXCEDEN el umbral (no del dataset)
 
     # ---------- util ----------
     def check_filter_update_criteria(self, epoch):
         return (epoch >= self.epochs_to_start_filter and
                 (epoch - self.epochs_to_start_filter) % self.update_period_in_epochs == 0)
 
-    # ---------- reduccion: PCA ----------
+    # ---------- PCA ----------
     def apply_pca(self, Z, explained_variance=None, n_components=None):
         if explained_variance is not None:
             pca = PCA(n_components=explained_variance, random_state=self.random_state)
@@ -239,7 +247,6 @@ class DataSelector:
             print(f"PCA realizado con {ncomp} componentes.")
         return T, ncomp
 
-    # ---------- envoltorio de dimensionalidad (solo PCA) ----------
     def apply_dimensionality(self, Z, explained_variance=None, n_components=None):
         return self.apply_pca(Z, explained_variance, n_components)
 
@@ -250,7 +257,6 @@ class DataSelector:
         X_np = _maybe_to_numpy(X)
         n = len(X_np)
 
-        # Detectar PyTorch
         is_torch_model = hasattr(model, "parameters") and callable(getattr(model, "parameters"))
         device = None
         if is_torch_model:
@@ -268,7 +274,6 @@ class DataSelector:
                     o = model.inspector_out(b_t)
                 o_np = _to_numpy(o)
             else:
-                # Rama no-PyTorch (TF/Keras o funcion que acepte numpy)
                 o = model.inspector_out(batch_np)
                 o_np = _to_numpy(o)
 
@@ -276,7 +281,7 @@ class DataSelector:
 
         return np.concatenate(outs, axis=0)
 
-    # ---------- probas y score suave ----------
+    # ---------- util R->Pc|k y score clase-cluster ----------
     @staticmethod
     def _soft_class_given_cluster(R, y_idx, C):
         N, K = R.shape
@@ -295,10 +300,10 @@ class DataSelector:
         scores = np.sum(R * Pc_for_true.T, axis=1)
         scores = np.clip(scores, 0.0, 1.0)
         scores = np.round(scores, 2)
-        return scores  # en [0,1], redondeados
+        return scores
 
+    # ---------- clustering ----------
     def _cluster(self, U, K):
-        """Devuelve R y el modelo de mezcla ya entrenado (GMM/SMM)."""
         if self.filter_model == "gmm":
             print("Clustering: GMM")
             model = GMM(n_components=K,
@@ -316,38 +321,25 @@ class DataSelector:
         else:
             raise ValueError("filter_model debe ser 'gmm' o 'smm'")
 
-        # Temperatura y normalizacion
         if self.tau != 1.0:
             R = np.power(R + 1e-12, 1.0/self.tau)
             R = R / (R.sum(axis=1, keepdims=True) + 1e-12)
-
-        # Redondeo y normalizacion (modo soft por defecto)
         R = np.round(R, 2)
         R = R / (R.sum(axis=1, keepdims=True) + 1e-12)
-
         return R, model
 
-    # ---------- Señal de Mahalanobis por clase (GMM: chi2.sf | SMM: F.sf) ----------
-    def _mahalanobis_signal(self, U, y_idx, R, mix_model):
-        """
-        Calcula, por clase, la distancia d^2 y la señal de cola s^M_i:
-          - GMM: s^M_i = chi2.sf(d^2, df=r)
-          - SMM: s^M_i = F.sf(d^2 / r, r, nu_c)  (nu_c: d.o.f. del componente dominante por clase)
-        Devuelve:
-          - sM_all (N,) en [0,1]
-          - d2_all (N,) Mahalanobis^2
-          - pctl_d2 (N,) percentil de d2 dentro de su clase (0..100)
-          - meta por clase
-        """
+    # ---------- señal MAHA con umbral teórico ----------
+    def _mahalanobis_signal(self, U, y_idx, R, mix_model, alpha):
         N, r = U.shape
-        sM_all = np.full(N, np.nan, dtype=float)
-        d2_all = np.full(N, np.nan, dtype=float)
+        sM_all   = np.full(N, np.nan, dtype=float)
+        d2_all   = np.full(N, np.nan, dtype=float)
         pctl_all = np.full(N, np.nan, dtype=float)
-        meta = []  # (clase, n_c, nu_c or None)
+        d2_thr_all = np.full(N, np.nan, dtype=float)
 
         use_smm = (self.filter_model == "smm") and isinstance(mix_model, StudentMixture)
-
         classes = np.unique(y_idx)
+        meta = []
+
         for c in classes:
             idx_c = np.where(y_idx == c)[0]
             n_c = idx_c.size
@@ -357,8 +349,7 @@ class DataSelector:
 
             Uc = U[idx_c]
             mu = Uc.mean(axis=0)
-            cov = np.cov(Uc, rowvar=False)
-            cov = cov + self.gmm_reg_covar * np.eye(r)
+            cov = np.cov(Uc, rowvar=False) + self.gmm_reg_covar * np.eye(r)
 
             try:
                 cov_inv = linalg.inv(cov)
@@ -366,39 +357,33 @@ class DataSelector:
                 cov_inv = np.linalg.pinv(cov)
 
             diff = Uc - mu
-            d2 = np.einsum('ij,jk,ik->i', diff, cov_inv, diff)  # (n_c,)
+            d2 = np.einsum('ij,jk,ik->i', diff, cov_inv, diff)
             d2_all[idx_c] = d2
 
-            # percentil muestral de d2 dentro de la clase
             ranks = np.argsort(np.argsort(d2))
             pctl = 100.0 * (ranks + 1) / max(n_c, 1)
             pctl_all[idx_c] = pctl
 
             if use_smm and hasattr(mix_model, "degrees_of_freedom_"):
-                # componente dominante por responsabilidades promedio en la clase
-                R_c_mean = R[idx_c].mean(axis=0)  # (K,)
+                R_c_mean = R[idx_c].mean(axis=0)
                 k_star = int(np.argmax(R_c_mean))
-                nu_c = float(mix_model.degrees_of_freedom_[k_star])
-                nu_c = max(nu_c, 1.0)
+                nu_c = float(max(mix_model.degrees_of_freedom_[k_star], 1.0))
                 sM = f_dist.sf(d2 / max(r, 1), r, nu_c)
+                d2_thr = float(r) * float(f_dist.ppf(1.0 - alpha, r, nu_c))
                 meta.append((int(c), n_c, nu_c))
             else:
                 sM = chi2.sf(d2, df=r)
+                d2_thr = float(chi2.ppf(1.0 - alpha, df=r))
                 meta.append((int(c), n_c, None))
 
             sM_all[idx_c] = np.asarray(sM, dtype=float)
+            d2_thr_all[idx_c] = d2_thr
 
-        # clip numérico y redondeo para logging estable
         sM_all = np.clip(sM_all, 0.0, 1.0)
-        return sM_all, d2_all, pctl_all, meta
+        return sM_all, d2_all, pctl_all, meta, d2_thr_all
 
+    # ---------- drop por SCORE compuesto (por clase) ----------
     def _drop_by_rank_per_class(self, comp_scores, y_idx, p, gate_abs, floor_score):
-        """
-        Elimina el peor p% por clase (orden ascendente de 'comp_scores' = S_i).
-        Gating: si el percentil p de S_i excede 'gate_abs' → no-act en esa clase.
-        Floor: dentro del bottom-p%, solo elimina si S_i < floor_score.
-        Devuelve índices a CONSERVAR.
-        """
         N = comp_scores.size
         kept_indices = []
         C = int(len(np.unique(y_idx)))
@@ -415,7 +400,6 @@ class DataSelector:
             pctl_val = float(np.percentile(sc, p*100.0))
             k_drop = int(np.floor(p * n_c))
 
-            # gating (sobre S compuesto)
             if (gate_abs is not None) and (pctl_val > gate_abs):
                 kept_indices.append(idx_c)
                 print(f"[Clase {c}] gating: pctl_S={pctl_val:.3f} > {gate_abs:.3f} → no-act")
@@ -426,13 +410,13 @@ class DataSelector:
                 print(f"[Clase {c}] k_drop=0 (p={p:.3f}) | pctl_S={pctl_val:.3f}")
                 continue
 
-            order = np.argsort(sc)               # peores primero
-            cand = idx_c[order[:k_drop]]         # candidatos a eliminar por S
+            order = np.argsort(sc)         # peores primero
+            cand = idx_c[order[:k_drop]]   # bottom-p% por S
 
             if floor_score is not None:
                 cand_scores = np.round(np.clip(comp_scores[cand], 0.0, 1.0), 2)
                 floor_eff = np.round(float(floor_score), 2)
-                mask = cand_scores < floor_eff     # < estricto
+                mask = cand_scores < floor_eff   # < estricto
                 drop_local = set(cand[mask].tolist())
                 kept_from_cand = cand[~mask]
                 print(
@@ -455,61 +439,107 @@ class DataSelector:
     # ---------- pipeline principal ----------
     def get_train_data(self, epoch, model, outs_posibilities, explained_variance=None, n_components=None):
         if self.check_filter_update_criteria(epoch):
-            # 1) Forward del inspector
+            # 1) Inspector
             U_inspector = self._forward_inspector(model, self.X_tr)
 
-            # 2) Reduccion (PCA)
+            # 2) PCA
             U, r = self.apply_dimensionality(U_inspector, explained_variance, n_components)
 
-            # 3) Cluster responsibilities + modelo
+            # 3) Clustering
             K = self.y_tr.shape[1]
-            R, mix_model = self._cluster(U, K)           # R:(N,K)
+            R, mix_model = self._cluster(U, K)
             self._last_R = R
             self._last_mix_model = mix_model
             y_idx = _maybe_to_numpy(self.y_tr).argmax(axis=1)
 
-            print(f"Tamaño del set de entrenamiento (antes): {_maybe_to_numpy(self.X_tr).shape[0]}")
+            n_total = _maybe_to_numpy(self.X_tr).shape[0]
+            print(f"Tamaño del set de entrenamiento (antes): {n_total}")
 
-            # 4) Consistencia probabilistica s_i
+            # 4) s_i (consistencia) y 5) s_i^M + d2_thr
             Pc_given_k, _ = self._soft_class_given_cluster(R, y_idx, K)
-            s_prob = self._class_scores(R, y_idx, Pc_given_k)  # [0,1]
-            # 5) Señal geométrica s_i^M (cola)
-            s_maha, d2_all, pctl_d2, meta = self._mahalanobis_signal(U, y_idx, R, mix_model)
+            s_prob = self._class_scores(R, y_idx, Pc_given_k)
+            s_maha, d2_all, pctl_d2, meta, d2_thr_all = self._mahalanobis_signal(
+                U, y_idx, R, mix_model, alpha=self._MAHA_ALPHA
+            )
 
-            # 6) Score compuesto S_i = w1*s_i + w2*s_i^M
+            # 6) S_i compuesto
             S_comp = np.clip(self.w_score * s_prob + self.w_maha * s_maha, 0.0, 1.0)
             S_comp = np.round(S_comp, 2)
             s_prob_r = np.round(s_prob, 2)
-            s_maha_r = np.round(s_maha, 4)  # más precisión útil para colas
+            s_maha_r = np.round(s_maha, 4)
 
-            # Persistir mapas (por índice original del subset)
+            # Persistir mapas
             for i, orig in enumerate(self.original_indices):
                 oi = int(orig)
-                self.last_scores_map[oi] = float(S_comp[i])      # compuesto (S)
-                self.last_consistency_map[oi] = float(s_prob_r[i])
-                self.last_maha_tail_map[oi] = float(s_maha_r[i])
+                self.last_scores_map[oi]        = float(S_comp[i])
+                self.last_consistency_map[oi]   = float(s_prob_r[i])
+                self.last_maha_tail_map[oi]     = float(s_maha_r[i])
+                self.last_maha_d2_map[oi]       = float(d2_all[i]) if np.isfinite(d2_all[i]) else np.nan
+                thr_i = d2_thr_all[i] if np.isfinite(d2_thr_all[i]) else np.nan
+                self.last_maha_thr_map[oi]      = float(thr_i) if np.isfinite(thr_i) else np.nan
+                self.last_maha_excess_map[oi]   = float(d2_all[i] - d2_thr_all[i]) if (np.isfinite(d2_all[i]) and np.isfinite(d2_thr_all[i])) else np.nan
 
-            # logging corto de la señal geométrica
+            # Log SMM/chi2
             if self.filter_model == "smm":
                 print("Señal geométrica (SMM, cola F): nu_c dominante por clase:")
                 for c, n_c, nu_c in meta:
                     nu_txt = f"{nu_c:.2f}" if nu_c is not None else "N/A"
-                    print(f"  - Clase {c}: n={n_c} | nu_c≈{nu_txt}")
+                    print(f"  - Clase {int(c)}: n={n_c} | nu_c≈{nu_txt}")
             else:
                 print("Señal geométrica (GMM, cola chi2).")
 
-            # 7) Selección final por S_compuesto (gating+floor sobre S)
-            kept = self._drop_by_rank_per_class(S_comp, y_idx,
-                                                p=self.filter_percentile,
-                                                gate_abs=self.gating_score_abs,
-                                                floor_score=self.drop_below_score)
+            # 7) Remoción por SCORE compuesto (por clase)
+            kept_score = self._drop_by_rank_per_class(S_comp, y_idx,
+                                                      p=self.filter_percentile,
+                                                      gate_abs=self.gating_score_abs,
+                                                      floor_score=self.drop_below_score)
+            all_idx = np.arange(n_total, dtype=int)
+            removed_by_score = np.setdiff1d(all_idx, kept_score, assume_unique=False)
+            print(f"[SCORE] Eliminados por score compuesto: {removed_by_score.size}")
+
+            # 8) MAHA ESTRICTO: elimina SOLO el 5% de LOS QUE EXCEDEN el umbral teórico
+            finite_mask = np.isfinite(d2_all) & np.isfinite(d2_thr_all)
+            exceed_mask = finite_mask & (d2_all > d2_thr_all)
+            exceed_idx  = np.where(exceed_mask)[0]
+            pool_size   = exceed_idx.size
+
+            if pool_size > 0:
+                # top 5% ENTRE los 'exceeders' (no del dataset)
+                k_sel = int(math.ceil(self._MAHA_TOP_FRAC_EXCEEDERS * pool_size))
+                excess_values = d2_all[exceed_idx] - d2_thr_all[exceed_idx]
+                order_desc = np.argsort(-excess_values)   # mayor exceso primero
+                maha_sel_local = exceed_idx[order_desc[:k_sel]]
+
+                overlap = np.intersect1d(removed_by_score, maha_sel_local).size
+                share_dataset = (k_sel / max(1, n_total)) * 100.0
+                share_exceed  = (k_sel / max(1, pool_size)) * 100.0
+                ex_min = float(np.min(excess_values[order_desc[:k_sel]])) if k_sel > 0 else float('nan')
+                ex_max = float(np.max(excess_values[order_desc[:k_sel]])) if k_sel > 0 else float('nan')
+
+                print(
+                    f"[MAHA-STRICT α={self._MAHA_ALPHA:.3f}] exceeders={pool_size} | "
+                    f"seleccionados={k_sel} (={share_exceed:.2f}% de exceeders; {share_dataset:.2f}% del dataset) | "
+                    f"exceso[min,max]=[{ex_min:.4f},{ex_max:.4f}] | overlap_con_score={overlap}"
+                )
+
+                # breakdown por clase (solo de los seleccionados)
+                if k_sel > 0:
+                    for c in np.unique(y_idx[maha_sel_local]):
+                        n_c = int(np.sum(y_idx[maha_sel_local] == c))
+                        print(f"    · Clase {int(c)}: {n_c} removidos por MAHA")
+
+                kept = np.setdiff1d(kept_score, maha_sel_local, assume_unique=False)
+                removed_by_maha = maha_sel_local
+            else:
+                print(f"[MAHA-STRICT α={self._MAHA_ALPHA:.3f}] exceeders=0 → no-act")
+                kept = kept_score
+                removed_by_maha = np.array([], dtype=int)
 
             # índices removidos (locales y originales)
-            all_idx = np.arange(_maybe_to_numpy(self.X_tr).shape[0], dtype=int)
             removed_local = np.setdiff1d(all_idx, kept, assume_unique=False)
             removed_original = self.original_indices[removed_local]
 
-            # guardar S_compuesto al momento de remover
+            # guardar S_compuesto al momento de remover (para ambos mecanismos)
             for loc, orig in zip(removed_local, removed_original):
                 self.removal_scores[int(orig)] = float(self.last_scores_map[int(self.original_indices[loc])])
 
@@ -517,11 +547,11 @@ class DataSelector:
                 print("No se identificaron indices a conservar; mantengo dataset previo.")
                 return self.previous_X_tr, self.previous_y_tr, self.original_indices, self.all_removed_indices, self.inspector_layer_out
 
-            # 8) Actualizar dataset
+            # 9) Actualizar dataset
             kept_sorted = np.sort(kept)
             X_new_raw = _take(self.X_tr, kept_sorted)
             y_new_raw = _take(self.y_tr, kept_sorted)
-            orig_new = self.original_indices[kept_sorted]
+            orig_new  = self.original_indices[kept_sorted]
 
             X_new = _maybe_to_numpy(X_new_raw)
             y_new = _maybe_to_numpy(y_new_raw)
@@ -529,7 +559,9 @@ class DataSelector:
             # acumulado de removidos (originales)
             self.all_removed_indices.extend(removed_original.tolist())
             print("El dataset ha sido filtrado.")
-            print(f"Tamaño de datos removidos: {_maybe_to_numpy(self.X_tr).shape[0] - X_new.shape[0]}")
+            print(f"Tamaño de datos removidos (TOTAL): {n_total - X_new.shape[0]}")
+            print(f"  └─ detalle -> por SCORE: {removed_by_score.size} | por MAHA: {removed_by_maha.size} "
+                  f"(algunos pueden coincidir en ambas reglas)")
 
             # (opcional) entrenamiento con outliers
             if self.train_with_outliers and removed_local.size > 0:
@@ -566,11 +598,6 @@ class DataSelector:
 
     # ---------- utilidades de scores ----------
     def get_scores_by_original_index(self):
-        """
-        Devuelve un dict {orig_idx: S_compuesto} que combina:
-          - S_compuesto al momento de ser removido (si fue removido)
-          - último S_compuesto disponible (si no fue removido)
-        """
         out = dict(self.last_scores_map)
         out.update(self.removal_scores)
         return out
@@ -580,10 +607,7 @@ class DataSelector:
         return np.array([m.get(int(i), np.nan) for i in indices], dtype=float)
 
     def get_consistency_scores_by_original_index(self):
-        """Devuelve {orig_idx: s_i} (consistencia clase–cluster) del último ciclo."""
         return dict(self.last_consistency_map)
 
     def get_maha_tail_by_original_index(self):
-        """Devuelve {orig_idx: s_i^M} (cola geométrica) del último ciclo."""
         return dict(self.last_maha_tail_map)
-
