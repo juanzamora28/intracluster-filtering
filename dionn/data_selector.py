@@ -30,7 +30,9 @@ def _clip01_with_warning(name, value, allow_none=False):
 # StudentMixture (t-Student Mixture)
 # =========================
 class StudentMixture:
-    """Modelo de mezcla de distribuciones t de Student."""
+    """Modelo de mezcla de distribuciones t de Student.
+        Uses Cholesky decomposition to prevent numerical instability with outliers.
+    """
     def __init__(self, n_components, covariance_type='full', tol=1e-3, reg_covar=1e-6,
                  max_iter=100, random_state=None):
         self.n_components = n_components
@@ -57,9 +59,19 @@ class StudentMixture:
             if nu <= 0:
                 raise ValueError(f"Grados de libertad no validos: {nu}. Deben ser > 0.")
             diff = X - self.means_[k]
-            precision = linalg.inv(self.covariances_[k])
-            quad_form = np.sum(diff @ precision * diff, axis=1)
-            log_det_cov = np.log(max(linalg.det(self.covariances_[k]), 1e-10))
+            try:
+                # Use Cholesky instead of linalg.inv to avoid 'divide by zero' in matmul
+                L = linalg.cho_factor(self.covariances_[k], lower=True)
+                # Solve: z = L^-1 * diff.T -> quad_form = ||z||^2
+                z = linalg.solve_triangular(L[0], diff.T, lower=True).T
+                quad_form = np.sum(z**2, axis=1)
+                # Log-determinant from Cholesky diagonal
+                log_det_cov = 2 * np.sum(np.log(np.diag(L[0])))
+            except linalg.LinAlgError:
+                # Fallback to pseudo-inverse if matrix is singular
+                precision = linalg.pinv(self.covariances_[k])
+                quad_form = np.sum(diff @ precision * diff, axis=1)
+                log_det_cov = np.log(np.maximum(linalg.det(self.covariances_[k]), 1e-10))
             log_prob[:, k] = (
                 special.gammaln((nu + n_features) / 2)
                 - special.gammaln(nu / 2)
@@ -97,9 +109,20 @@ class StudentMixture:
         new_dof = np.empty(self.n_components)
         for k in range(self.n_components):
             diff = X - self.means_[k]
-            quad_form = np.sum(diff @ linalg.inv(self.covariances_[k]) * diff, axis=1)
-            weighted_quad_form = np.dot(resp[:, k], quad_form)
-            new_dof[k] = max(2 * (n_features + nk[k]) / (nk[k] - weighted_quad_form / (self.degrees_of_freedom_[k] + 2)), 1.0)
+            try:
+                L = linalg.cho_factor(self.covariances_[k], lower=True)
+                z = linalg.solve_triangular(L[0], diff.T, lower=True).T
+                quad_form = np.sum(z**2, axis=1)
+            except linalg.LinAlgError:
+                precision = linalg.pinv(self.covariances_[k])
+                quad_form = np.sum(diff @ precision * diff, axis=1)
+            weighted_quad = np.dot(resp[:, k], quad_form) / nk[k]
+            # Stabilized update (capped between 2 and 100)
+            # nu = 2 * E[d^2] / (E[d^2] - features) - heuristic
+            denom = max(weighted_quad - n_features, 1e-5)
+            val = 2 * weighted_quad / denom
+            new_dof[k] = 2.0 + (val - 2.0) * np.exp(-(val / 10.0)) # force heavy tails in case is close to a gaussian
+            
         return new_dof
 
     def fit(self, X):
@@ -229,23 +252,43 @@ class DataSelector:
 
     # ---------- PCA ----------
     def apply_pca(self, Z, explained_variance=None, n_components=None):
-        if explained_variance is not None:
-            pca = PCA(n_components=explained_variance, random_state=self.random_state)
-        elif n_components is not None:
-            pca = PCA(n_components=n_components, random_state=self.random_state)
-        else:
-            raise ValueError("Debes proporcionar explained_variance o n_components.")
+        """
+        Applies PCA with pre and post-processing to ensure numerical stability.
+        """
+        original_cols = Z.shape[1]
+        
+        # Eliminate information from neurons that have almost zero variance
+        # This prevents division by zero during normalization
+        Z = np.ascontiguousarray(Z, dtype=np.float64)
+        variance_mask = np.var(Z, axis=0) > 1e-3
+        Z = Z[:, variance_mask]
+        post_variance_cols = Z.shape[1]
+        Z = (Z - np.mean(Z, axis=0)) / (np.std(Z, axis=0) + 1e-10)
+        if explained_variance is None and n_components is None:
+            raise ValueError("You must provide either explained_variance or n_components.")
+        # Use svd_solver='full' in case the rank is incomplete or the matrix is ill-conditioned
+        pca = PCA(
+            n_components=explained_variance or n_components, 
+            random_state=self.random_state, 
+            svd_solver='full'
+        )
         T = pca.fit_transform(Z)
-        ncomp = T.shape[1]
-        if ncomp < 2:
-            pca = PCA(n_components=2, random_state=self.random_state)
-            T = pca.fit_transform(Z)
-            ncomp = 2
-        if explained_variance is not None:
-            print(f"PCA realizado: se retuvo el {explained_variance*100:.1f}% de la varianza con {ncomp} componentes.")
-        else:
-            print(f"PCA realizado con {ncomp} componentes.")
-        return T, ncomp
+        pca_cols = T.shape[1]
+    
+        # Eliminate components with almost zero variance to avoid clustering problems
+        # Even after PCA, the last components can have tiny eigenvalues that cause 'divide by zero' in clustering
+        component_mask = np.var(T, axis=0) > 1e-5
+        T = T[:, component_mask]
+        final_cols = T.shape[1]
+    
+        # --- CLEANING REPORT ---
+        print(f"\n*** PCA CLEANING REPORT ***")
+        print(f"Original Neurons: {original_cols} -> After 1e-3 Filter: {post_variance_cols} remain (before PCA)")
+        print(f"PCA Components:   {pca_cols} -> After 1e-5 Filter: {final_cols} remain")
+        print(f"Total Columns Removed: {original_cols - final_cols}")
+        print(f"*****************************\n")
+        
+        return T, final_cols
 
     def apply_dimensionality(self, Z, explained_variance=None, n_components=None):
         return self.apply_pca(Z, explained_variance, n_components)
@@ -284,11 +327,14 @@ class DataSelector:
     # ---------- util R->Pc|k y score clase-cluster ----------
     @staticmethod
     def _soft_class_given_cluster(R, y_idx, C):
+        
         N, K = R.shape
         Y = np.zeros((N, C), dtype=np.float64)
         Y[np.arange(N), y_idx] = 1.0
         Nk = R.sum(axis=0) + 1e-12           # (K,)
-        Nkc = R.T @ Y                         # (K,C)
+        Nkc = np.zeros((K, C), dtype=np.float64)
+        for c in range(C):
+            Nkc[:, c] = R[y_idx == c].sum(axis=0)
         Pc_given_k = Nkc / (Nk[:, None] + 1e-12)   # (K,C)
         Pc_given_k = np.round(Pc_given_k, 2)
         Pc_given_k = Pc_given_k / (Pc_given_k.sum(axis=1, keepdims=True) + 1e-12)
@@ -304,18 +350,25 @@ class DataSelector:
 
     # ---------- clustering ----------
     def _cluster(self, U, K):
+        
+        U = np.ascontiguousarray(U, dtype=np.float64)
+        
         if self.filter_model == "gmm":
             print("Clustering: GMM")
             model = GMM(n_components=K,
                         covariance_type=self.gmm_covariance_type,
                         reg_covar=self.gmm_reg_covar,
-                        random_state=self.random_state)
+                        random_state=self.random_state,
+                        init_params='random')
             model.fit(U)
             R = model.predict_proba(U)
+            
         elif self.filter_model == "smm":
             print("Clustering: SMM (t-Student)")
-            model = StudentMixture(n_components=K, random_state=self.random_state,
-                                   covariance_type="full", max_iter=100, tol=1e-3)
+            model = StudentMixture(n_components=K, 
+                                   random_state=self.random_state,
+                                   covariance_type="full", 
+                                   max_iter=100, tol=1e-3)
             model.fit(U)
             R = model.predict_proba(U)
         else:
@@ -442,6 +495,7 @@ class DataSelector:
             # 1) Inspector
             U_inspector = self._forward_inspector(model, self.X_tr)
 
+
             # 2) PCA
             U, r = self.apply_dimensionality(U_inspector, explained_variance, n_components)
 
@@ -454,9 +508,14 @@ class DataSelector:
 
             n_total = _maybe_to_numpy(self.X_tr).shape[0]
             print(f"Tamaño del set de entrenamiento (antes): {n_total}")
+            
 
             # 4) s_i (consistencia) y 5) s_i^M + d2_thr
             Pc_given_k, _ = self._soft_class_given_cluster(R, y_idx, K)
+            
+            
+            
+            
             s_prob = self._class_scores(R, y_idx, Pc_given_k)
             s_maha, d2_all, pctl_d2, meta, d2_thr_all = self._mahalanobis_signal(
                 U, y_idx, R, mix_model, alpha=self._MAHA_ALPHA
